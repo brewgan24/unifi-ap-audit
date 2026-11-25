@@ -4,340 +4,135 @@ import * as XLSX from 'xlsx'
 import './styles.css'
 
 const DEFAULT_APS = [
-  ['ap1', 'LT1 - Cafe Bar'],
-  ['ap2', 'LT1 - Casual Eat'],
-  ['ap3', 'LT1 - Casual Work'],
-  ['ap4', 'LT2 - Cafe Library'],
-  ['ap5', 'LT2 - Concentration'],
-  ['ap6', 'LT2 - Kiva'],
-  ['ap7', 'LT2 - MultiRoom'],
-  ['ap8', 'LT3 - Meeting Room'],
-  ['ap9', 'Outdoor Area'],
+  ['ap1', 'LT1 - Cafe Bar'], ['ap2', 'LT1 - Casual Eat'], ['ap3', 'LT1 - Casual Work'],
+  ['ap4', 'LT2 - Cafe Library'], ['ap5', 'LT2 - Concentration'], ['ap6', 'LT2 - Kiva'],
+  ['ap7', 'LT2 - MultiRoom'], ['ap8', 'LT3 - Meeting Room'], ['ap9', 'Outdoor Area'],
 ].map(([id, name]) => ({ id, name }))
 
-const emptyData = () => ({ myDeviceRaw: '', otherClientsRaw: '', speedtestImg: null })
-
-const UNIFI_FIELD_NAMES = [
-  'Client name', 'MAC address', 'Access point', 'Network', 'Connection quality',
-  'Signal', 'Wi-Fi mode', 'Channel', 'Radio / channel width', 'IP address',
-  'Upload rate', 'Download rate', 'Activity', 'Usage', 'Connected time',
-  'Transmit rate', 'Receive rate',
+const FIELDS = [
+  ['name', 'Client name'], ['mac', 'MAC address'], ['accessPoint', 'Access point'], ['network', 'Network'],
+  ['quality', 'Connection quality'], ['signal', 'Signal'], ['wifiMode', 'Wi-Fi mode'], ['channel', 'Channel'],
+  ['radioWidth', 'Radio / channel width'], ['ip', 'IP address'], ['uploadRate', 'Upload rate'],
+  ['downloadRate', 'Download rate'], ['activity', 'Activity'], ['usage', 'Usage'], ['connectedTime', 'Connected time'],
+  ['transmitRate', 'Transmit rate'], ['receiveRate', 'Receive rate'],
 ]
+const EMPTY_CLIENT = Object.fromEntries(FIELDS.map(([key]) => [key, '']))
+const emptyData = () => ({ auditDate: todayISO(), myDeviceRaw: '', otherClientsRaw: '', myDevice: null, clients: [], speedtestImg: null, speedtest: { download: '', upload: '', ping: '', server: '', testedAt: '' }, notes: '' })
 
-function loadJson(key, fallback) {
-  try {
-    const saved = localStorage.getItem(key)
-    return saved ? JSON.parse(saved) : fallback
-  } catch {
-    return fallback
-  }
-}
+function todayISO() { return new Date().toISOString().slice(0, 10) }
+function loadJson(key, fallback) { try { const value = localStorage.getItem(key); return value ? JSON.parse(value) : fallback } catch { return fallback } }
+function titleCase(value) { return value ? value.charAt(0).toUpperCase() + value.slice(1) : '' }
 
-function parseRows(raw) {
+function parseRawRows(raw) {
   if (!raw?.trim()) return []
   const lines = raw.trim().split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
   if (!lines.length) return []
-  if (lines.some((line) => line.includes('\t'))) {
-    return lines.map((row) => row.split('\t').map((cell) => cell.trim()))
-  }
+  if (lines.some((line) => line.includes('\t'))) return lines.map((line) => line.split('\t').map((cell) => cell.trim()))
 
-  // UniFi's browser copy can put every cell on its own line. MAC addresses
-  // provide a reliable record boundary when several clients are pasted.
   const macIndexes = lines.reduce((indexes, line, index) => {
     if (/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(line)) indexes.push(index)
     return indexes
   }, [])
-  if (macIndexes.length) {
-    const starts = macIndexes.map((macIndex, recordIndex) => recordIndex === 0 ? 0 : Math.max(0, macIndex - 1))
-    return starts.map((start, recordIndex) => {
-      const end = starts[recordIndex + 1] ?? lines.length
-      return lines.slice(start, end)
-    }).filter((row) => row.length)
-  }
+  if (!macIndexes.length) return [lines]
+  return macIndexes.map((macIndex, index) => {
+    const start = Math.max(0, macIndex - 1)
+    const end = macIndexes[index + 1] ? Math.max(start + 1, macIndexes[index + 1] - 1) : lines.length
+    return lines.slice(start, end)
+  }).filter(Boolean)
+}
 
-  // A single vertical record has no MAC boundary to split on.
-  return [lines]
+function rowToClient(row) {
+  const client = { ...EMPTY_CLIENT }
+  FIELDS.forEach(([key], index) => { client[key] = row[index] ?? '' })
+  return client
+}
+function rawToClients(raw) { return parseRawRows(raw).map(rowToClient).filter((client) => Object.values(client).some(Boolean)) }
+function clientsToRaw(clients) { return clients.map((client) => FIELDS.map(([key]) => client[key] || '').join('\t')).join('\n') }
+function getData(data) {
+  const safe = { ...emptyData(), ...data, speedtest: { ...emptyData().speedtest, ...(data?.speedtest ?? {}) } }
+  const myDevice = safe.myDevice && Object.values(safe.myDevice).some(Boolean) ? safe.myDevice : rawToClients(safe.myDeviceRaw)[0] ?? null
+  const clients = Array.isArray(safe.clients) && safe.clients.length ? safe.clients : rawToClients(safe.otherClientsRaw)
+  return { ...safe, myDevice, clients }
+}
+function hasData(data) { const safe = getData(data); return Boolean(safe.myDevice || safe.clients.length || safe.speedtestImg || safe.notes?.trim()) }
+function statusOf(client) { return (client?.quality || '').toLowerCase() }
+function tone(value) { const lower = String(value ?? '').toLowerCase(); if (lower === 'excellent' || lower === 'good') return 'good'; if (lower === 'fair') return 'warn'; if (lower === 'poor') return 'bad'; if (lower.includes('mbps')) return 'speed'; if (String(value).includes('dBm')) { const signal = Number.parseInt(value, 10); return signal >= -60 ? 'good' : signal >= -75 ? 'warn' : 'bad' } return '' }
+function formatDate(date) { return date ? new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(new Date(`${date}T00:00:00`)) : '—' }
+function Icon({ children }) { return <span className="icon" aria-hidden="true">{children}</span> }
+
+function StatCard({ icon, label, value, detail, color }) { return <div className={`stat-card ${color}`}><div className="stat-icon">{icon}</div><div><span>{label}</span><strong>{value}</strong><small>{detail}</small></div></div> }
+function StatusBadge({ value }) { const status = value || 'Not recorded'; return <span className={`status-badge ${tone(status)}`}>{status}</span> }
+
+function DeviceFields({ client, compact = false }) {
+  const visible = compact ? FIELDS.filter(([key]) => ['mac', 'network', 'quality', 'signal', 'wifiMode', 'channel', 'ip', 'connectedTime'].includes(key)) : FIELDS
+  return <div className={`device-fields ${compact ? 'compact' : ''}`}>{visible.map(([key, label]) => <div className="device-field" key={key}><span>{label}</span><strong className={tone(client?.[key])}>{client?.[key] || '—'}</strong></div>)}</div>
+}
+
+function ClientTable({ clients, onEdit, onDelete }) {
+  if (!clients.length) return <div className="table-empty"><span>♧</span><strong>No other connected devices</strong><small>Paste UniFi client data or add a device manually.</small></div>
+  return <div className="client-table-wrap"><table className="client-table"><thead><tr><th>Client</th><th>MAC address</th><th>IP address</th><th>Network</th><th>Signal</th><th>Quality</th><th>Rates</th><th /></tr></thead><tbody>{clients.map((client, index) => <tr key={`${client.mac || client.name || 'client'}-${index}`}><td><strong>{client.name || 'Unnamed client'}</strong><small>{client.wifiMode || '—'}</small></td><td>{client.mac || '—'}</td><td>{client.ip || '—'}</td><td>{client.network || '—'}</td><td className={tone(client.signal)}>{client.signal || '—'}</td><td><StatusBadge value={client.quality} /></td><td><span className="rate-text">↓ {client.downloadRate || '—'}</span><span className="rate-text">↑ {client.uploadRate || '—'}</span></td><td className="row-actions"><button onClick={() => onEdit(client, index)} title="Edit client">✎</button><button onClick={() => onDelete(index)} title="Delete client">×</button></td></tr>)}</tbody></table></div>
+}
+
+function ImageDropzone({ image, onImage, onRemove, fileInputRef }) {
+  const readImage = (file) => { if (!file || !file.type.startsWith('image/')) return; const reader = new FileReader(); reader.onload = (event) => onImage(event.target.result); reader.readAsDataURL(file) }
+  return <div className={`dropzone ${image ? 'has-image' : ''}`} onClick={() => fileInputRef.current?.click()}>{image ? <><img src={image} alt="Ookla speed test" /><span className="image-overlay">↻ Replace screenshot</span><button className="remove-image" onClick={(event) => { event.stopPropagation(); onRemove() }}>×</button></> : <><span className="upload-icon">▧</span><strong>Drop screenshot here</strong><span>or click to browse · Ctrl + V</span></>}<input ref={fileInputRef} type="file" accept="image/*" hidden onChange={(event) => { readImage(event.target.files?.[0]); event.target.value = '' }} /></div>
+}
+
+function ClientEditor({ client, title, onSave, onClose }) {
+  const [draft, setDraft] = useState({ ...EMPTY_CLIENT, ...client })
+  const update = (key, value) => setDraft((current) => ({ ...current, [key]: value }))
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal large-modal"><div className="modal-title"><div><span className="eyebrow">DEVICE CRUD</span><h3>{title}</h3></div><button className="close-button" onClick={onClose}>×</button></div><div className="editor-grid">{FIELDS.map(([key, label]) => <label key={key}>{label}<input value={draft[key]} onChange={(event) => update(key, event.target.value)} placeholder={label} /></label>)}</div><div className="modal-actions"><button className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" onClick={() => onSave(draft)}>Save device</button></div></section></div>
+}
+
+function LocationModal({ aps, onAdd, onEdit, onDelete, onClose }) {
+  const [name, setName] = useState('')
+  const [editing, setEditing] = useState(null)
+  const submit = (event) => { event.preventDefault(); if (!name.trim()) return; editing ? onEdit(editing.id, name.trim()) : onAdd(name.trim()); setName(''); setEditing(null) }
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal"><div className="modal-title"><div><span className="eyebrow">WORKSPACE CRUD</span><h3>Manage locations</h3></div><button className="close-button" onClick={onClose}>×</button></div><form className="add-form" onSubmit={submit}><input value={name} onChange={(event) => setName(event.target.value)} placeholder={editing ? 'Rename location' : 'e.g. LT1 - Lobby'} autoFocus /><button className="primary-button" type="submit">{editing ? 'Save' : 'Add'}</button></form><div className="modal-list">{aps.map((ap) => <div className="modal-item" key={ap.id}><span>{ap.name}</span><div><button onClick={() => { setEditing(ap); setName(ap.name) }}>Edit</button><button className="danger-text" onClick={() => onDelete(ap.id)}>Delete</button></div></div>)}{!aps.length && <p className="modal-empty">No locations found.</p>}</div><button className="modal-done" onClick={onClose}>Done</button></section></div>
 }
 
 function exportExcel(aps, allData, dateLabel) {
-  const summary = [['UniFi AP Audit Report'], ['Date', dateLabel], [], ['Access point', 'Status', 'My device rows', 'Other client rows', 'Speed test screenshot']]
-  const records = [['Access point', 'Record type', ...UNIFI_FIELD_NAMES]]
-  const rawInput = [['Access point', 'Input type', 'Raw value']]
-  const maxFields = UNIFI_FIELD_NAMES.length
-
-  aps.forEach((ap) => {
-    const data = allData[ap.id] ?? emptyData()
-    const deviceRows = parseRows(data.myDeviceRaw)
-    const clientRows = parseRows(data.otherClientsRaw)
-    const hasAuditData = Boolean(data.myDeviceRaw?.trim() || data.otherClientsRaw?.trim() || data.speedtestImg)
-    summary.push([ap.name, hasAuditData ? 'In progress' : 'Not started', deviceRows.length, clientRows.length, data.speedtestImg ? 'Attached in app' : 'Not attached'])
-
-    deviceRows.forEach((row) => records.push([ap.name, 'My device', ...row.slice(0, maxFields), ...Array(Math.max(0, maxFields - row.length)).fill('')]))
-    clientRows.forEach((row) => records.push([ap.name, 'Other client', ...row.slice(0, maxFields), ...Array(Math.max(0, maxFields - row.length)).fill('')]))
-    if (data.myDeviceRaw?.trim()) rawInput.push([ap.name, 'My device', data.myDeviceRaw])
-    if (data.otherClientsRaw?.trim()) rawInput.push([ap.name, 'Other clients', data.otherClientsRaw])
-  })
-
-  const workbook = XLSX.utils.book_new()
-  const addSheet = (name, rows, widths = []) => {
-    const sheet = XLSX.utils.aoa_to_sheet(rows)
-    if (widths.length) sheet['!cols'] = widths.map((width) => ({ wch: width }))
-    XLSX.utils.book_append_sheet(workbook, sheet, name)
-  }
-  addSheet('Summary', summary, [28, 18, 16, 18, 24])
-  addSheet('Structured data', records, [24, 16, ...UNIFI_FIELD_NAMES.map(() => 20)])
-  addSheet('Raw input', rawInput, [24, 18, 80])
-  XLSX.writeFile(workbook, `unifi-ap-audit-${new Date().toISOString().slice(0, 10)}.xlsx`)
-}
-
-function getCellTone(value) {
-  const text = String(value ?? '').trim()
-  const lower = text.toLowerCase()
-  if (!text) return 'muted'
-  if (lower === 'excellent' || lower === 'good') return 'good'
-  if (lower === 'fair') return 'warn'
-  if (lower === 'poor') return 'bad'
-  if (lower.includes('mbps')) return 'speed'
-  if (text.includes('dBm')) {
-    const signal = Number.parseInt(text, 10)
-    if (!Number.isNaN(signal)) return signal >= -60 ? 'good' : signal >= -75 ? 'warn' : 'bad'
-  }
-  return ''
-}
-
-function Icon({ children, className = '' }) {
-  return <span className={`icon ${className}`} aria-hidden="true">{children}</span>
-}
-
-function AuditTable({ rows, emptyLabel }) {
-  if (!rows.length) return <div className="empty-table">{emptyLabel}</div>
-  return (
-    <table className="audit-table">
-      <tbody>
-        {rows.map((row, rowIndex) => (
-          <tr key={rowIndex}>
-            {row.map((cell, cellIndex) => (
-              <td className={getCellTone(cell)} title={cell} key={`${rowIndex}-${cellIndex}`}>
-                {cell || '—'}
-              </td>
-            ))}
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  )
-}
-
-function ImageDropzone({ image, onImage, fileInputRef }) {
-  const readImage = (file) => {
-    if (!file || !file.type.startsWith('image/')) return
-    const reader = new FileReader()
-    reader.onload = (event) => onImage(event.target.result)
-    reader.readAsDataURL(file)
-  }
-
-  return (
-    <div className={`dropzone ${image ? 'has-image' : ''}`} onClick={() => fileInputRef.current?.click()}>
-      {image ? (
-        <>
-          <img src={image} alt="Ookla speed test" />
-          <span className="image-overlay">↻ Replace screenshot</span>
-        </>
-      ) : (
-        <>
-          <span className="upload-icon">▧</span>
-          <strong>Drop screenshot here</strong>
-          <span>or click to browse · Ctrl + V</span>
-        </>
-      )}
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept="image/*"
-        hidden
-        onChange={(event) => {
-          readImage(event.target.files?.[0])
-          event.target.value = ''
-        }}
-      />
-    </div>
-  )
+  const summary = [['UniFi Wi-Fi Audit Dashboard'], ['Exported', dateLabel], [], ['Location', 'Audit date', 'Status', 'My device', 'Other devices', 'Total devices', 'Alerts']]
+  const devices = [['Location', 'Record type', ...FIELDS.map(([, label]) => label)]]
+  aps.forEach((ap) => { const data = getData(allData[ap.id]); const all = data.myDevice ? [data.myDevice, ...data.clients] : data.clients; const alerts = all.filter((client) => ['fair', 'poor'].includes(statusOf(client))).length; summary.push([ap.name, data.auditDate, hasData(data) ? 'In progress' : 'Not started', data.myDevice?.name || '', data.clients.length, all.length, alerts]); if (data.myDevice) devices.push([ap.name, 'My device', ...FIELDS.map(([key]) => data.myDevice[key] || '')]); data.clients.forEach((client) => devices.push([ap.name, 'Other device', ...FIELDS.map(([key]) => client[key] || '')])) })
+  const workbook = XLSX.utils.book_new(); const addSheet = (name, rows, widths) => { const sheet = XLSX.utils.aoa_to_sheet(rows); sheet['!cols'] = widths.map((wch) => ({ wch })); XLSX.utils.book_append_sheet(workbook, sheet, name) }; addSheet('Dashboard', summary, [25, 15, 15, 24, 15, 15, 10]); addSheet('Devices', devices, [24, 16, ...FIELDS.map(() => 20)]); XLSX.writeFile(workbook, `unifi-audit-${todayISO()}.xlsx`)
 }
 
 function App() {
   const [aps, setAps] = useState(() => loadJson('unifi-audit-aps', DEFAULT_APS))
   const [allData, setAllData] = useState(() => loadJson('unifi-audit-data', {}))
   const [selectedApId, setSelectedApId] = useState(() => loadJson('unifi-audit-aps', DEFAULT_APS)[0]?.id ?? null)
-  const [showSettings, setShowSettings] = useState(false)
-  const [newApName, setNewApName] = useState('')
-  const [notice, setNotice] = useState('')
-  const fileInputRef = useRef(null)
-
+  const [showLocations, setShowLocations] = useState(false); const [editor, setEditor] = useState(null); const [notice, setNotice] = useState(''); const fileInputRef = useRef(null)
   useEffect(() => localStorage.setItem('unifi-audit-aps', JSON.stringify(aps)), [aps])
-  useEffect(() => {
-    try {
-      localStorage.setItem('unifi-audit-data', JSON.stringify(allData))
-    } catch {
-      setNotice('Storage is full. Try removing an older screenshot.')
-    }
-  }, [allData])
-  useEffect(() => {
-    setAllData((current) => {
-      const next = { ...current }
-      aps.forEach((ap) => { if (!next[ap.id]) next[ap.id] = emptyData() })
-      return next
-    })
-  }, [aps])
-  useEffect(() => {
-    const onPaste = (event) => {
-      const item = [...(event.clipboardData?.items ?? [])].find((entry) => entry.kind === 'file' && entry.type.startsWith('image/'))
-      if (!item || !selectedApId) return
-      event.preventDefault()
-      const file = item.getAsFile()
-      if (!file) return
-      const reader = new FileReader()
-      reader.onload = (loadEvent) => updateCurrent({ speedtestImg: loadEvent.target.result })
-      reader.readAsDataURL(file)
-    }
-    window.addEventListener('paste', onPaste)
-    return () => window.removeEventListener('paste', onPaste)
-  })
-  useEffect(() => {
-    if (!notice) return undefined
-    const timer = window.setTimeout(() => setNotice(''), 3600)
-    return () => window.clearTimeout(timer)
-  }, [notice])
+  useEffect(() => { try { localStorage.setItem('unifi-audit-data', JSON.stringify(allData)) } catch { setNotice('Browser storage is full. Remove an old screenshot.') } }, [allData])
+  useEffect(() => { setAllData((current) => { const next = { ...current }; aps.forEach((ap) => { if (!next[ap.id]) next[ap.id] = emptyData() }); return next }) }, [aps])
+  useEffect(() => { const onPaste = (event) => { const item = [...(event.clipboardData?.items ?? [])].find((entry) => entry.kind === 'file' && entry.type.startsWith('image/')); if (!item || !selectedApId) return; event.preventDefault(); const file = item.getAsFile(); if (!file) return; const reader = new FileReader(); reader.onload = (loadEvent) => updateData({ speedtestImg: loadEvent.target.result }); reader.readAsDataURL(file) }; window.addEventListener('paste', onPaste); return () => window.removeEventListener('paste', onPaste) })
+  useEffect(() => { if (!notice) return undefined; const timer = window.setTimeout(() => setNotice(''), 3600); return () => window.clearTimeout(timer) }, [notice])
 
-  const currentAp = aps.find((ap) => ap.id === selectedApId)
-  const currentData = allData[selectedApId] ?? emptyData()
-  const myDeviceRows = useMemo(() => parseRows(currentData.myDeviceRaw), [currentData.myDeviceRaw])
-  const clientRows = useMemo(() => parseRows(currentData.otherClientsRaw), [currentData.otherClientsRaw])
-  const completedCount = aps.filter((ap) => hasData(ap.id)).length
-  const dateLabel = new Intl.DateTimeFormat('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }).format(new Date())
+  const currentAp = aps.find((ap) => ap.id === selectedApId); const currentData = getData(allData[selectedApId]); const allCurrentDevices = currentData.myDevice ? [currentData.myDevice, ...currentData.clients] : currentData.clients; const dateLabel = new Intl.DateTimeFormat('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }).format(new Date()); const auditedCount = aps.filter((ap) => hasData(allData[ap.id])).length; const totalDevices = aps.reduce((total, ap) => { const data = getData(allData[ap.id]); return total + data.clients.length + (data.myDevice ? 1 : 0) }, 0); const alertCount = aps.reduce((total, ap) => total + getData(allData[ap.id]).clients.filter((client) => ['fair', 'poor'].includes(statusOf(client))).length, 0)
 
-  function hasData(id) {
-    const data = allData[id]
-    return Boolean(data?.myDeviceRaw?.trim() || data?.otherClientsRaw?.trim() || data?.speedtestImg)
-  }
+  function updateData(patch) { if (!selectedApId) return; setAllData((current) => ({ ...current, [selectedApId]: { ...emptyData(), ...(current[selectedApId] ?? {}), ...patch } })) }
+  function importRaw(type, raw) { const parsed = rawToClients(raw); if (type === 'myDeviceRaw') updateData({ myDeviceRaw: raw, myDevice: parsed[0] ?? null }); else updateData({ otherClientsRaw: raw, clients: parsed }) }
+  function saveDevice(device, index) { if (editor?.type === 'my') updateData({ myDevice: device, myDeviceRaw: clientsToRaw([device]) }); else { const clients = [...currentData.clients]; if (index === null) clients.push(device); else clients[index] = device; updateData({ clients, otherClientsRaw: clientsToRaw(clients) }) }; setEditor(null); setNotice('Device saved') }
+  function deleteClient(index) { const clients = currentData.clients.filter((_, clientIndex) => clientIndex !== index); updateData({ clients, otherClientsRaw: clientsToRaw(clients) }); setNotice('Device removed') }
+  function clearAudit() { if (!currentAp || !window.confirm(`Start a new audit for ${currentAp.name}? Existing data will be cleared.`)) return; updateData(emptyData()); setNotice('New audit started') }
+  function addLocation(name) { const id = `ap_${Date.now()}`; setAps((items) => [...items, { id, name }]); setAllData((data) => ({ ...data, [id]: emptyData() })); setSelectedApId(id); setNotice('Location added') }
+  function editLocation(id, name) { setAps((items) => items.map((ap) => ap.id === id ? { ...ap, name } : ap)); setNotice('Location renamed') }
+  function deleteLocation(id) { const ap = aps.find((item) => item.id === id); if (!ap || !window.confirm(`Delete ${ap.name} and its audit data?`)) return; const remaining = aps.filter((item) => item.id !== id); setAps(remaining); setAllData((data) => { const next = { ...data }; delete next[id]; return next }); if (selectedApId === id) setSelectedApId(remaining[0]?.id ?? null) }
 
-  function updateCurrent(patch) {
-    if (!selectedApId) return
-    setAllData((current) => ({ ...current, [selectedApId]: { ...(current[selectedApId] ?? emptyData()), ...patch } }))
-  }
-
-  function addAp(event) {
-    event?.preventDefault()
-    const name = newApName.trim()
-    if (!name) return
-    const id = `ap_${Date.now()}`
-    setAps((current) => [...current, { id, name }])
-    setAllData((current) => ({ ...current, [id]: emptyData() }))
-    setSelectedApId(id)
-    setNewApName('')
-    setNotice(`${name} added`)
-  }
-
-  function removeAp(id) {
-    const ap = aps.find((item) => item.id === id)
-    if (!ap || !window.confirm(`Remove ${ap.name} and all its audit data?`)) return
-    const remaining = aps.filter((item) => item.id !== id)
-    setAps(remaining)
-    setAllData((current) => { const next = { ...current }; delete next[id]; return next })
-    if (selectedApId === id) setSelectedApId(remaining[0]?.id ?? null)
-  }
-
-  function clearCurrent() {
-    if (!currentAp || !window.confirm(`Clear all data for ${currentAp.name}?`)) return
-    updateCurrent(emptyData())
-    setNotice('Current audit cleared')
-  }
-
-  return (
-    <div className="app-shell">
-      <aside className="sidebar no-print">
-        <div className="brand">
-          <div className="brand-mark"><Icon>⌁</Icon></div>
-          <div><h1>AP Audit</h1><span>UNIFI WORKSPACE</span></div>
-        </div>
-        <div className="sidebar-date"><span className="status-dot" /> {dateLabel}</div>
-        <div className="location-heading"><span>ACCESS POINTS</span><button className="icon-button" onClick={() => setShowSettings(true)} title="Manage access points">⚙</button></div>
-        <nav className="locations" aria-label="Access points">
-          {aps.map((ap) => (
-            <button key={ap.id} className={`location ${selectedApId === ap.id ? 'selected' : ''}`} onClick={() => setSelectedApId(ap.id)}>
-              <span className={`ap-icon ${hasData(ap.id) ? 'complete' : ''}`}>⌁</span>
-              <span className="location-name">{ap.name}</span>
-              {hasData(ap.id) && <span className="check">✓</span>}
-            </button>
-          ))}
-          {!aps.length && <div className="sidebar-empty">No access points yet.</div>}
-        </nav>
-        <div className="sidebar-footer">
-          <div className="progress-label"><span>DAILY PROGRESS</span><strong>{completedCount}/{aps.length}</strong></div>
-          <div className="progress-track"><div style={{ width: aps.length ? `${(completedCount / aps.length) * 100}%` : '0%' }} /></div>
-          <div className="export-actions">
-            <button className="export-button" onClick={() => exportExcel(aps, allData, dateLabel)}><Icon>⇩</Icon> Export Excel</button>
-            <button className="print-button" onClick={() => window.print()}>▣ Print / PDF</button>
-          </div>
-          <p className="local-note">Saved locally in this browser</p>
-        </div>
-      </aside>
-
-      <main className="workspace">
-        <header className="topbar">
-          <div><span className="eyebrow">DAILY AUDIT / {dateLabel.toUpperCase()}</span><h2>{currentAp?.name ?? 'No access point selected'}</h2></div>
-          {currentAp && <button className="clear-button" onClick={clearCurrent}>⌫ <span>Clear data</span></button>}
-        </header>
-
-        {currentAp ? (
-          <div className="content">
-            <section className="intro-row"><div><h3>Audit input</h3><p>Paste today’s UniFi client data and attach a speed test screenshot.</p></div><span className={`completion-pill ${hasData(currentAp.id) ? 'done' : ''}`}>{hasData(currentAp.id) ? '✓ IN PROGRESS' : '○ NOT STARTED'}</span></section>
-            <div className="input-grid">
-              <div className="input-column">
-                <section className="card data-card">
-                  <div className="card-heading"><div className="card-icon blue">▣</div><div><h4>My device data</h4><p>Paste one UniFi row · tabs or vertical copy</p></div></div>
-                  <textarea value={currentData.myDeviceRaw} onChange={(event) => updateCurrent({ myDeviceRaw: event.target.value })} placeholder="DESKTOP-2OIAP1F…    192.168.1.20    Excellent…" spellCheck="false" />
-                  <div className="field-hint">One row only · data stays in your browser</div>
-                </section>
-                <section className="card data-card clients-card">
-                  <div className="card-heading"><div className="card-icon violet">♧</div><div><h4>Other connected clients</h4><p>Paste multiple UniFi rows · tabs or vertical copy</p></div></div>
-                  <textarea value={currentData.otherClientsRaw} onChange={(event) => updateCurrent({ otherClientsRaw: event.target.value })} placeholder={'Client-01…    192.168.1.21    Good…\nClient-02…    192.168.1.22    Fair…'} spellCheck="false" />
-                  <div className="field-hint">Paste as many rows as needed</div>
-                </section>
-              </div>
-              <section className="card screenshot-card">
-                <div className="card-heading"><div className="card-icon green">◉</div><div><h4>Ookla speed test</h4><p>Screenshot evidence</p></div></div>
-                <ImageDropzone image={currentData.speedtestImg} onImage={(speedtestImg) => updateCurrent({ speedtestImg })} fileInputRef={fileInputRef} />
-                <div className="field-hint"><kbd>CTRL</kbd> + <kbd>V</kbd> to paste an image from clipboard</div>
-              </section>
-            </div>
-
-            <section className="preview-section">
-              <div className="section-heading"><div><span className="eyebrow">LIVE OUTPUT</span><h3>Spreadsheet preview</h3></div><span className="format-label">AUTO-DETECTED UNIFI FORMAT</span></div>
-              <div className="preview-card">
-                <div className="preview-head"><span>DEVICE & CLIENT HEALTH</span><span>{myDeviceRows.length + clientRows.length} row{myDeviceRows.length + clientRows.length === 1 ? '' : 's'}</span></div>
-                <div className="preview-body">
-                  <AuditTable rows={myDeviceRows.slice(0, 1)} emptyLabel="No device data entered yet" />
-                  <div className="preview-lower"><div className="preview-image">{currentData.speedtestImg ? <img src={currentData.speedtestImg} alt="Speed test preview" /> : <><span>▧</span><small>No screenshot</small></>}</div><div className="client-table"><AuditTable rows={clientRows} emptyLabel="No other client data entered yet" /></div></div>
-                </div>
-              </div>
-              <p className="preview-note"><span>i</span> Values are color-coded automatically: signal strength, connection quality, and throughput.</p>
-            </section>
-          </div>
-        ) : (
-          <div className="no-ap"><span>⌁</span><h3>No access points available</h3><p>Use the settings button to add your first location.</p><button className="primary-button" onClick={() => setShowSettings(true)}>Manage access points</button></div>
-        )}
-      </main>
-
-      {showSettings && <div className="modal-backdrop no-print" onMouseDown={(event) => event.target === event.currentTarget && setShowSettings(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="modal-title"><div><span className="eyebrow">WORKSPACE SETTINGS</span><h3 id="settings-title">Manage access points</h3></div><button className="close-button" onClick={() => setShowSettings(false)}>×</button></div><form className="add-form" onSubmit={addAp}><input value={newApName} onChange={(event) => setNewApName(event.target.value)} placeholder="e.g. LT1 - Lobby" autoFocus /><button className="primary-button" type="submit">Add AP</button></form><div className="modal-list">{aps.map((ap) => <div className="modal-item" key={ap.id}><span><i className={hasData(ap.id) ? 'green-dot' : ''} />{ap.name}</span><button onClick={() => removeAp(ap.id)} aria-label={`Remove ${ap.name}`}>Remove</button></div>)}{!aps.length && <p className="modal-empty">No locations found.</p>}</div><button className="modal-done" onClick={() => setShowSettings(false)}>Done</button></section></div>}
-      {notice && <div className="toast">✓ {notice}</div>}
-
-      <PrintReport aps={aps} allData={allData} dateLabel={dateLabel} />
-    </div>
-  )
+  return <div className="app-shell">
+    <aside className="sidebar no-print"><div className="brand"><div className="brand-mark">⌁</div><div><h1>AP Audit</h1><span>UNIFI DASHBOARD</span></div></div><div className="sidebar-date"><span className="status-dot" /> {dateLabel}</div><div className="location-heading"><span>LOCATIONS</span><button className="icon-button" onClick={() => setShowLocations(true)} title="Manage locations">⚙</button></div><nav className="locations">{aps.map((ap) => <button key={ap.id} className={`location ${selectedApId === ap.id ? 'selected' : ''}`} onClick={() => setSelectedApId(ap.id)}><span className={`ap-icon ${hasData(allData[ap.id]) ? 'complete' : ''}`}>⌁</span><span className="location-name">{ap.name}</span>{hasData(allData[ap.id]) && <span className="check">✓</span>}</button>)}{!aps.length && <div className="sidebar-empty">No locations yet.</div>}</nav><div className="sidebar-footer"><div className="progress-label"><span>DAILY PROGRESS</span><strong>{auditedCount}/{aps.length}</strong></div><div className="progress-track"><div style={{ width: aps.length ? `${auditedCount / aps.length * 100}%` : '0%' }} /></div><button className="export-button" onClick={() => exportExcel(aps, allData, dateLabel)}><Icon>⇩</Icon> Export Excel</button><button className="print-button" onClick={() => window.print()}>▣ Print / PDF</button><p className="local-note">Saved locally in this browser</p></div></aside>
+    <main className="workspace"><header className="topbar"><div><span className="eyebrow">WI-FI AUDIT DASHBOARD / {dateLabel.toUpperCase()}</span><h2>{currentAp?.name ?? 'No location selected'}</h2></div>{currentAp && <div className="top-actions"><button className="secondary-button" onClick={() => setShowLocations(true)}>⚙ Locations</button><button className="clear-button" onClick={clearAudit}>＋ New audit</button></div>}</header>
+      <div className="dashboard-content"><section className="dashboard-intro"><div><span className="eyebrow">OVERVIEW</span><h3>Network health at a glance</h3><p>Manage daily UniFi audits and review connected devices by location.</p></div><span className="storage-pill">● LOCAL WORKSPACE</span></section><div className="stats-grid"><StatCard icon="⌁" label="Locations" value={aps.length} detail={`${auditedCount} audited today`} color="blue" /><StatCard icon="◈" label="Total devices" value={totalDevices} detail="Across all locations" color="violet" /><StatCard icon="✓" label="Audit progress" value={`${auditedCount}/${aps.length}`} detail="Locations completed" color="green" /><StatCard icon="!" label="Needs attention" value={alertCount} detail="Fair or poor signal" color="orange" /></div>
+        <div className="location-tabs"><div className="tabs-label">AUDIT LOCATIONS</div><div className="tabs-scroll">{aps.map((ap) => <button key={ap.id} className={selectedApId === ap.id ? 'active' : ''} onClick={() => setSelectedApId(ap.id)}><span className={hasData(allData[ap.id]) ? 'tab-dot done' : 'tab-dot'} />{ap.name}</button>)}<button className="add-tab" onClick={() => setShowLocations(true)}>＋ Add location</button></div></div>
+        {currentAp ? <><section className="location-heading-row"><div><span className="eyebrow">LOCATION AUDIT</span><h3>{currentAp.name}</h3><p>Audit date: <strong>{formatDate(currentData.auditDate)}</strong> · Last saved locally</p></div><div className="audit-actions"><label className="date-control">Audit date<input type="date" value={currentData.auditDate || todayISO()} onChange={(event) => updateData({ auditDate: event.target.value })} /></label><StatusBadge value={hasData(currentData) ? 'In progress' : 'Not started'} /></div></section><div className="dashboard-grid"><section className="dashboard-card device-card"><div className="card-top"><div><span className="eyebrow">PRIMARY DEVICE</span><h4>My device</h4></div><button className="outline-button" onClick={() => setEditor({ type: 'my', client: currentData.myDevice ?? EMPTY_CLIENT })}>✎ {currentData.myDevice ? 'Edit' : 'Add device'}</button></div>{currentData.myDevice ? <><div className="device-identity"><div className="device-avatar">▣</div><div><strong>{currentData.myDevice.name || 'Unnamed device'}</strong><span>{currentData.myDevice.ip || 'No IP'} · {currentData.myDevice.mac || 'No MAC'}</span></div><StatusBadge value={currentData.myDevice.quality} /></div><DeviceFields client={currentData.myDevice} compact /></> : <div className="card-empty"><span>▣</span><strong>No primary device recorded</strong><small>Paste UniFi data below or add it manually.</small></div>}<div className="raw-import"><label>Import My Device data <span>TSV or vertical UniFi copy</span></label><textarea value={currentData.myDeviceRaw} onChange={(event) => importRaw('myDeviceRaw', event.target.value)} placeholder={'LAPTOP-CINMP20D\n24:b2:b9:60:ed:0d\nLT1 - Casual East\nDBI_Office\nExcellent\n-49 dBm\n…'} spellCheck="false" /></div></section>
+          <section className="dashboard-card speed-card"><div className="card-top"><div><span className="eyebrow">EVIDENCE</span><h4>Ookla speed test</h4></div>{currentData.speedtestImg && <button className="danger-button" onClick={() => updateData({ speedtestImg: null })}>Delete</button>}</div><ImageDropzone image={currentData.speedtestImg} onImage={(speedtestImg) => updateData({ speedtestImg })} onRemove={() => updateData({ speedtestImg: null })} fileInputRef={fileInputRef} /><div className="speed-fields"><label>Download<input value={currentData.speedtest.download} onChange={(event) => updateData({ speedtest: { ...currentData.speedtest, download: event.target.value } })} placeholder="192 Mbps" /></label><label>Upload<input value={currentData.speedtest.upload} onChange={(event) => updateData({ speedtest: { ...currentData.speedtest, upload: event.target.value } })} placeholder="78 Mbps" /></label><label>Ping<input value={currentData.speedtest.ping} onChange={(event) => updateData({ speedtest: { ...currentData.speedtest, ping: event.target.value } })} placeholder="12 ms" /></label><label>Server<input value={currentData.speedtest.server} onChange={(event) => updateData({ speedtest: { ...currentData.speedtest, server: event.target.value } })} placeholder="Ookla server" /></label></div></section>
+        </div><section className="dashboard-card clients-card"><div className="card-top"><div><span className="eyebrow">CONNECTED DEVICES</span><h4>Other connected devices <span className="count-badge">{currentData.clients.length}</span></h4><p>Devices connected to this access point during the audit.</p></div><div className="card-buttons"><button className="outline-button" onClick={() => setEditor({ type: 'client', index: null, client: EMPTY_CLIENT })}>＋ Add device</button><button className="outline-button" onClick={() => document.getElementById('client-import')?.focus()}>⇧ Import data</button></div></div><ClientTable clients={currentData.clients} onEdit={(client, index) => setEditor({ type: 'client', index, client })} onDelete={deleteClient} /><div className="raw-import clients-import"><label htmlFor="client-import">Import other connected devices <span>Multiple TSV rows or vertical UniFi copies</span></label><textarea id="client-import" value={currentData.otherClientsRaw} onChange={(event) => importRaw('otherClientsRaw', event.target.value)} placeholder="Paste one or more client records here…" spellCheck="false" /></div><div className="client-footer"><span>Total connected devices</span><strong>{allCurrentDevices.length}</strong><span className="footer-separator" /> <span>Other devices</span><strong>{currentData.clients.length}</strong></div></section><section className="dashboard-card notes-card"><div className="card-top"><div><span className="eyebrow">AUDIT NOTES</span><h4>Notes for this location</h4></div></div><textarea value={currentData.notes} onChange={(event) => updateData({ notes: event.target.value })} placeholder="Add observations, maintenance notes, or follow-up actions…" /></section></> : <div className="no-ap"><span>⌁</span><h3>No locations available</h3><p>Add a location to start your first audit.</p><button className="primary-button" onClick={() => setShowLocations(true)}>Manage locations</button></div>}
+      </div></main>
+    {showLocations && <LocationModal aps={aps} onAdd={addLocation} onEdit={editLocation} onDelete={deleteLocation} onClose={() => setShowLocations(false)} />}{editor && <ClientEditor client={editor.client} title={editor.type === 'my' ? 'Edit my device' : editor.index === null ? 'Add connected device' : 'Edit connected device'} onSave={(client) => saveDevice(client, editor.index)} onClose={() => setEditor(null)} />}{notice && <div className="toast">✓ {notice}</div>}<PrintReport aps={aps} allData={allData} dateLabel={dateLabel} />
+  </div>
 }
 
-function PrintReport({ aps, allData, dateLabel }) {
-  return <div className="print-report"><h1>Daily Wi-Fi AP Audit Report</h1><p>{dateLabel}</p>{aps.map((ap) => { const data = allData[ap.id] ?? emptyData(); return <section key={ap.id}><h2>{ap.name}</h2>{!data.myDeviceRaw?.trim() && !data.otherClientsRaw?.trim() && !data.speedtestImg ? <em>No data recorded for this location.</em> : <><AuditTable rows={parseRows(data.myDeviceRaw).slice(0, 1)} emptyLabel="No device data" /><div className="print-lower"><div className="print-image">{data.speedtestImg ? <img src={data.speedtestImg} alt="Speed test" /> : 'No speed test image'}</div><AuditTable rows={parseRows(data.otherClientsRaw)} emptyLabel="No other clients" /></div></>}</section>})}</div>
-}
+function PrintReport({ aps, allData, dateLabel }) { return <div className="print-report"><h1>Daily Wi-Fi AP Audit Report</h1><p>{dateLabel}</p>{aps.map((ap) => { const data = getData(allData[ap.id]); const devices = data.myDevice ? [data.myDevice, ...data.clients] : data.clients; return <section key={ap.id}><h2>{ap.name} · {formatDate(data.auditDate)}</h2>{!devices.length && !data.speedtestImg ? <em>No data recorded for this location.</em> : <><table><tbody>{devices.map((client, index) => <tr key={index}>{FIELDS.slice(0, 10).map(([key]) => <td key={key}>{client[key] || '—'}</td>)}</tr>)}</tbody></table>{data.speedtestImg && <img className="print-speed" src={data.speedtestImg} alt="Speed test" />}</>}</section> })}</div> }
 
 createRoot(document.getElementById('root')).render(<StrictMode><App /></StrictMode>)
