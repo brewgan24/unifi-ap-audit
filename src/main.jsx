@@ -1,5 +1,6 @@
 import { StrictMode, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
+import * as XLSX from 'xlsx'
 import './styles.css'
 
 const DEFAULT_APS = [
@@ -16,6 +17,13 @@ const DEFAULT_APS = [
 
 const emptyData = () => ({ myDeviceRaw: '', otherClientsRaw: '', speedtestImg: null })
 
+const UNIFI_FIELD_NAMES = [
+  'Client name', 'MAC address', 'Access point', 'Network', 'Connection quality',
+  'Signal', 'Wi-Fi mode', 'Channel', 'Radio / channel width', 'IP address',
+  'Upload rate', 'Download rate', 'Activity', 'Usage', 'Connected time',
+  'Transmit rate', 'Receive rate',
+]
+
 function loadJson(key, fallback) {
   try {
     const saved = localStorage.getItem(key)
@@ -27,7 +35,59 @@ function loadJson(key, fallback) {
 
 function parseRows(raw) {
   if (!raw?.trim()) return []
-  return raw.trim().split(/\r?\n/).map((row) => row.split('\t'))
+  const lines = raw.trim().split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  if (!lines.length) return []
+  if (lines.some((line) => line.includes('\t'))) {
+    return lines.map((row) => row.split('\t').map((cell) => cell.trim()))
+  }
+
+  // UniFi's browser copy can put every cell on its own line. MAC addresses
+  // provide a reliable record boundary when several clients are pasted.
+  const macIndexes = lines.reduce((indexes, line, index) => {
+    if (/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(line)) indexes.push(index)
+    return indexes
+  }, [])
+  if (macIndexes.length) {
+    const starts = macIndexes.map((macIndex, recordIndex) => recordIndex === 0 ? 0 : Math.max(0, macIndex - 1))
+    return starts.map((start, recordIndex) => {
+      const end = starts[recordIndex + 1] ?? lines.length
+      return lines.slice(start, end)
+    }).filter((row) => row.length)
+  }
+
+  // A single vertical record has no MAC boundary to split on.
+  return [lines]
+}
+
+function exportExcel(aps, allData, dateLabel) {
+  const summary = [['UniFi AP Audit Report'], ['Date', dateLabel], [], ['Access point', 'Status', 'My device rows', 'Other client rows', 'Speed test screenshot']]
+  const records = [['Access point', 'Record type', ...UNIFI_FIELD_NAMES]]
+  const rawInput = [['Access point', 'Input type', 'Raw value']]
+  const maxFields = UNIFI_FIELD_NAMES.length
+
+  aps.forEach((ap) => {
+    const data = allData[ap.id] ?? emptyData()
+    const deviceRows = parseRows(data.myDeviceRaw)
+    const clientRows = parseRows(data.otherClientsRaw)
+    const hasAuditData = Boolean(data.myDeviceRaw?.trim() || data.otherClientsRaw?.trim() || data.speedtestImg)
+    summary.push([ap.name, hasAuditData ? 'In progress' : 'Not started', deviceRows.length, clientRows.length, data.speedtestImg ? 'Attached in app' : 'Not attached'])
+
+    deviceRows.forEach((row) => records.push([ap.name, 'My device', ...row.slice(0, maxFields), ...Array(Math.max(0, maxFields - row.length)).fill('')]))
+    clientRows.forEach((row) => records.push([ap.name, 'Other client', ...row.slice(0, maxFields), ...Array(Math.max(0, maxFields - row.length)).fill('')]))
+    if (data.myDeviceRaw?.trim()) rawInput.push([ap.name, 'My device', data.myDeviceRaw])
+    if (data.otherClientsRaw?.trim()) rawInput.push([ap.name, 'Other clients', data.otherClientsRaw])
+  })
+
+  const workbook = XLSX.utils.book_new()
+  const addSheet = (name, rows, widths = []) => {
+    const sheet = XLSX.utils.aoa_to_sheet(rows)
+    if (widths.length) sheet['!cols'] = widths.map((width) => ({ wch: width }))
+    XLSX.utils.book_append_sheet(workbook, sheet, name)
+  }
+  addSheet('Summary', summary, [28, 18, 16, 18, 24])
+  addSheet('Structured data', records, [24, 16, ...UNIFI_FIELD_NAMES.map(() => 20)])
+  addSheet('Raw input', rawInput, [24, 18, 80])
+  XLSX.writeFile(workbook, `unifi-ap-audit-${new Date().toISOString().slice(0, 10)}.xlsx`)
 }
 
 function getCellTone(value) {
@@ -214,7 +274,10 @@ function App() {
         <div className="sidebar-footer">
           <div className="progress-label"><span>DAILY PROGRESS</span><strong>{completedCount}/{aps.length}</strong></div>
           <div className="progress-track"><div style={{ width: aps.length ? `${(completedCount / aps.length) * 100}%` : '0%' }} /></div>
-          <button className="export-button" onClick={() => window.print()}><Icon>⇩</Icon> Export report</button>
+          <div className="export-actions">
+            <button className="export-button" onClick={() => exportExcel(aps, allData, dateLabel)}><Icon>⇩</Icon> Export Excel</button>
+            <button className="print-button" onClick={() => window.print()}>▣ Print / PDF</button>
+          </div>
           <p className="local-note">Saved locally in this browser</p>
         </div>
       </aside>
@@ -231,12 +294,12 @@ function App() {
             <div className="input-grid">
               <div className="input-column">
                 <section className="card data-card">
-                  <div className="card-heading"><div className="card-icon blue">▣</div><div><h4>My device data</h4><p>Raw row from UniFi · tab separated</p></div></div>
+                  <div className="card-heading"><div className="card-icon blue">▣</div><div><h4>My device data</h4><p>Paste one UniFi row · tabs or vertical copy</p></div></div>
                   <textarea value={currentData.myDeviceRaw} onChange={(event) => updateCurrent({ myDeviceRaw: event.target.value })} placeholder="DESKTOP-2OIAP1F…    192.168.1.20    Excellent…" spellCheck="false" />
                   <div className="field-hint">One row only · data stays in your browser</div>
                 </section>
                 <section className="card data-card clients-card">
-                  <div className="card-heading"><div className="card-icon violet">♧</div><div><h4>Other connected clients</h4><p>Multiple rows from UniFi · tab separated</p></div></div>
+                  <div className="card-heading"><div className="card-icon violet">♧</div><div><h4>Other connected clients</h4><p>Paste multiple UniFi rows · tabs or vertical copy</p></div></div>
                   <textarea value={currentData.otherClientsRaw} onChange={(event) => updateCurrent({ otherClientsRaw: event.target.value })} placeholder={'Client-01…    192.168.1.21    Good…\nClient-02…    192.168.1.22    Fair…'} spellCheck="false" />
                   <div className="field-hint">Paste as many rows as needed</div>
                 </section>
@@ -249,7 +312,7 @@ function App() {
             </div>
 
             <section className="preview-section">
-              <div className="section-heading"><div><span className="eyebrow">LIVE OUTPUT</span><h3>Spreadsheet preview</h3></div><span className="format-label">TSV / UNIFI EXPORT FORMAT</span></div>
+              <div className="section-heading"><div><span className="eyebrow">LIVE OUTPUT</span><h3>Spreadsheet preview</h3></div><span className="format-label">AUTO-DETECTED UNIFI FORMAT</span></div>
               <div className="preview-card">
                 <div className="preview-head"><span>DEVICE & CLIENT HEALTH</span><span>{myDeviceRows.length + clientRows.length} row{myDeviceRows.length + clientRows.length === 1 ? '' : 's'}</span></div>
                 <div className="preview-body">
